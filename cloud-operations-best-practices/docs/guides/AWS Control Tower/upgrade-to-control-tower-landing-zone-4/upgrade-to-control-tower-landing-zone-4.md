@@ -80,6 +80,83 @@ aws iam get-role --role-name AWSControlTowerExecution > ct_exec_role_backup.json
 aws iam get-role --role-name AWSControlTowerCloudTrailRole > ct_cloudtrail_role_backup.json
 ```
 
+### AWS CloudFormation StackSet prerequisites
+
+#### Remove closed/suspended account stack instances
+
+When AWS accounts are closed, their AWS CloudFormation stack instances in the management account's `AWSControlTowerBP-*` StackSets are **not automatically removed**. During the upgrade, AWS Control Tower attempts to update these StackSets and fails because it cannot assume `AWSControlTowerExecution` in closed accounts. This is a [documented limitation](https://docs.aws.amazon.com/controltower/latest/userguide/troubleshooting.html#unable-to-update-landing-zone).
+
+In organizations that have closed accounts over time, this can cause the upgrade to stall while each StackSet operation times out sequentially. To prevent this, run the following pre-flight check and remediation before upgrading:
+
+**Pre-flight check:**
+
+```bash
+# Identify closed/suspended accounts
+CLOSED=$(aws organizations list-accounts \
+  --query "Accounts[?Status!='ACTIVE'].Id" --output text)
+
+# Check for orphaned stack instances in AWS Control Tower StackSets
+for SS in $(aws cloudformation list-stack-sets --status ACTIVE \
+  --query "Summaries[?starts_with(StackSetName,'AWSControlTowerBP-')].StackSetName" \
+  --output text); do
+  for ACCT in $CLOSED; do
+    COUNT=$(aws cloudformation list-stack-instances --stack-set-name "$SS" \
+      --query "length(Summaries[?Account=='${ACCT}'])" --output text)
+    [ "$COUNT" -gt 0 ] && echo "BLOCKER: $SS has $COUNT instances for closed account $ACCT"
+  done
+done
+```
+
+**Suggested Remediation:**
+
+```bash
+# For each StackSet flagged as BLOCKER in the pre-flight check above,
+# remove the orphaned instances for the closed account
+aws cloudformation delete-stack-instances \
+  --stack-set-name "<stackset-name>" \
+  --accounts '["<closed-account-id>"]' \
+  --regions '["us-east-1","us-west-2"]' \
+  --retain-stacks \
+  --no-cli-pager
+```
+
+> **Important**: The [`--retain-stacks`](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/delete-stack-instances.html) flag is required. Without it, AWS CloudFormation attempts to assume `AWSControlTowerExecution` in the closed account to delete the stack, which will fail.
+
+#### Verify no termination protection on AWS Control Tower baseline stacks
+
+The v4.0 upgrade deletes or replaces certain AWS CloudFormation stacks in member accounts (particularly AWS Config-related baselines). If those stacks have termination protection enabled, StackSet operations fail and the upgrade stalls.
+
+AWS Control Tower does **not** enable termination protection on its baseline stacks — it uses [SCPs (mandatory preventive controls)](https://docs.aws.amazon.com/prescriptive-guidance/latest/designing-control-tower-landing-zone/mandatory.html) instead. However, termination protection may have been enabled outside AWS Control Tower, such as:
+
+- **AWS Security Hub CSPM auto-remediation** — [CloudFormation.3](https://docs.aws.amazon.com/securityhub/latest/userguide/cloudformation-controls.html) recommends termination protection on all stacks. Auto-remediation enables it on every stack, including AWS Control Tower-managed ones.
+- **[AWS Landing Zone Accelerator](https://docs.aws.amazon.com/solutions/latest/landing-zone-accelerator-on-aws/problem-validationerror.html)**, which enables termination protection on its provisioned stacks by default.
+
+**Pre-flight check (run from management account):**
+
+```bash
+# Assume role into a member account
+CREDS=$(aws sts assume-role \
+  --role-arn "arn:aws:iam::<member-account-id>:role/AWSControlTowerExecution" \
+  --role-session-name "tp-check" --query Credentials --output json)
+
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .AccessKeyId)
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .SecretAccessKey)
+export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .SessionToken)
+
+# Check AWS Control Tower baseline stacks for termination protection
+aws cloudformation describe-stacks --region <region> \
+  --query "Stacks[?starts_with(StackName,'StackSet-AWSControlTowerBP-')].\
+  [StackName,EnableTerminationProtection]" --output table
+```
+
+**Suggested Remediation:**
+
+```bash
+aws cloudformation update-termination-protection \
+  --no-enable-termination-protection \
+  --stack-name "<stack-name>" --region <region>
+```
+
 ### AWS CloudTrail prerequisites
 
 If you are upgrading via API and have AWS CloudTrail integration enabled:
